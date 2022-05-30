@@ -1,2 +1,0 @@
-class DNSServer():
-    pass

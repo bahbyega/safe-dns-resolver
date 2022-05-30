@@ -1,11 +1,17 @@
-from dnslib import *
+import os.path
+
+import dns.message
+import dns.query
+
+from dnslib import A, QTYPE, NS, MX, CNAME
+from dnslib import DNSLabel, RR
+from dnslib.server import BaseResolver
+
+from main import logger
 
 # currently supported record types for config file
 TYPES = {
-    "A": QTYPE.A,
-    "NS": QTYPE.NS,
-    "MX": QTYPE.MX,
-    "CNAME": QTYPE.CNAME
+    "A": (A, QTYPE.A)
 }
 
 ROOT_SERVERS = (
@@ -24,14 +30,15 @@ ROOT_SERVERS = (
     "202.12.27.33"
 )
 
-class DNSResolver():
+class DNSResolver(BaseResolver):
 
     def __init__(self, config_file):
+        super()
         self.domain_filter = self.__load_config(config_file)
         self.domain_cache = {}
 
     def __load_config(self, config_file):
-        if config_file.exist():
+        if os.path.exists(config_file):
             print(f"Loading configuration file at {config_file}: ")
             domain_filter = {}
 
@@ -39,25 +46,23 @@ class DNSResolver():
                 for line in config:
                     line = line.rstrip('\n\t\r ')
 
-                    host, type, data = line.split(maxsplit=2)
+                    host, type, data = line.split(maxsplit=2)                
 
-                    if type not in TYPES:
-                        raise ValueError(f"Record type '{type}' is not supported.")                    
-
-                    domain_filter[(host, type)] = RR(
+                    domain_filter[(DNSLabel(host), TYPES[type][1])] = RR(
                         rname=DNSLabel(host),
-                        rtype=TYPES[type],
-                        rclass=1,
-                        rdata=data
+                        rtype=TYPES[type][1],
+                        rdata=TYPES[type][0](str(data)),
                         ttl=3600
                     )
+
+            print(f"Loaded {config_file}: ")
 
             return domain_filter
         
         else:
             raise FileNotFoundError(f"File '{config_file}' was not foung.")
 
-    def __get_rr(self, q):
+    def algo(self, q):
         if q in self.domain_filter:
             return self.domain_filter[q]
 
@@ -66,46 +71,93 @@ class DNSResolver():
         
         else:
             for root_server in ROOT_SERVERS:
-                rr = self.send_request(root_server, q)
-                self.domain_cache[q] = rr
+                qname, _ = q
+                name = dns.name.from_text(str(qname))
+                request = dns.message.make_query(name, dns.rdatatype.A)
+                reply = self.ask_remote(request, root_server, q)
 
-                return rr
+                for zones in reply.answer:
+                    for zone in zones:
+                        if zone.rdtype in [QTYPE.A]:
+                            
+                            rr = RR(
+                                rname=DNSLabel(qname),
+                                rtype=QTYPE.A,
+                                rdata=A(str(zone)),
+                                ttl=3600
+                            )
+                            self.domain_cache[(DNSLabel(qname), QTYPE.A)] = rr
+                            
+                            return rr
+                        
+                        else:
+                            print("Unsupported type")
+
+    
+    def ask_remote(self, request, ip, q):
+        qname, _ = q
+        qname = dns.name.from_text(str(qname))
+        response = dns.query.udp(request, ip)
+
+        if response.answer:
+            return response
+
+        else:
+            if response.additional:
+                add_request = dns.message.make_query(qname, dns.rdatatype.A)
                 
-    def send_request(self, root_server, q):
-        qname, qtype = q
-        question = DNSRecord.question(qname, qtype)
+                i = 0
+                while response.additional[i].rdtype != 1:
+                    i += 1
+                if response.additional[i].rdtype == 1:
+                    return self.ask_remote(add_request, str(response.additional[i][0]), q)
+
+            else:
+                root_request = dns.message.make_query(str(response.authority[0][0]), dns.rdatatype.A)
+                authority_ip = self.dig_ip(str(response.authority[0][0]), root_request, ip)
+                auth_request = dns.message.make_query(qname, dns.rdatatype.A)
+
+                return self.ask_remote(auth_request, str(authority_ip[0]), q)
+
+    def dig_ip(self, auth_domain, request, ip):
+        response = dns.query.udp(request, ip)
         
-        r_packet = question.send(root_server, 53)
-        response = DNSRecord.parse(r_packet)
+        if response.answer:
+            return response.answer[0]
+
+        else:
+            if response.additional:
+                additional_request = dns.message.make_query(auth_domain, dns.rdatatype.A)
+                i = 0
+                while response.additional[i].rdtype != 1:
+                    i += 1
+
+                if response.additional[i].rdtype == 1:
+
+                    return self.dig_ip(auth_domain, additional_request, str(response.additional[i][0]))
+            else:
+                root_request = dns.message.make_query(str(response.authority[0][0]), dns.rdatatype.A)
+
+                authority_ip = self.dig_ip(response.authority[0][0], root_request, ROOT_SERVERS[0])
+                authority_request = dns.message.make_query(auth_domain, dns.rdatatype.A)
+                
+                return self.dig_ip(auth_domain, authority_request, str(authority_ip[0]))
 
 
-        if question.header.id != response.header.id:
-            raise DNSError('Response transaction id does not match query transaction id')
+    def resolve(self, request, handler):
+        reply = request.reply()
 
-        return response.rr
-
-
-    def dns_reply(self, packet):
-        request = DNSRecord.parse(packet)
-
-        reply = DNSRecord(
-            DNSHeader(
-                id=request.header.id
-                qr=1
-                aa=1
-                ra=1
-            ),
-            q=request.q
-        )
-
-        qname = request.q.qname
-        qtype = request.q.qtype
+        qname = reply.q.qname
+        qtype = reply.q.qtype
         q = (qname, qtype)
+
+        rr = self.algo(q)
+
+        if rr:
+            logger.info(f'Found record for {q}')
+        else:
+            logger.info('Error searching for record')
         
-        resource_record = self.__get_rr(q)
-        reply.add_answer(resource_record)
-
-        return reply.pack()
-
-    def resolve(self, packet):
-        reply = self.dns_reply(packet)
+        reply.add_answer(rr)
+        
+        return reply
